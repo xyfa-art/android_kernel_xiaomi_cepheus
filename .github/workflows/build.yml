@@ -10,45 +10,117 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Source
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Setup Build Environment
         run: |
+          set -e
           sudo apt-get update
-          sudo apt-get install -y git bc bison build-essential ccache curl flex g++-multilib gcc-multilib clang lld llvm libssl-dev libxml2-utils make zlib1g-dev libncurses5-dev
-          # Menambahkan Clang yang lebih baru jika diperlukan
-          sudo apt-get install -y clang-14
+          sudo apt-get install -y \
+            git bc bison build-essential ccache curl flex \
+            g++-multilib gcc-multilib clang-14 lld llvm \
+            libssl-dev libxml2-utils make zlib1g-dev libncurses5-dev
+          
+          # Set clang-14 as default
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-14 100
 
-      - name: Patch Resukisu (KernelSU + Susfs)
+      - name: Setup KernelSU Resukisu (KernelSU + Susfs)
         run: |
-          # Mengambil source KernelSU
+          set -e
+          
+          # Download KernelSU
+          echo "Downloading KernelSU v0.9.5..."
           curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s v0.9.5
           
-          # Patching tambahan untuk Susfs (Resukisu)
-          # Sesuaikan URL/branch jika ada perubahan dari pengembang Resukisu
+          if [ ! -d "KernelSU" ]; then
+            echo "ERROR: KernelSU setup failed - directory not created"
+            exit 1
+          fi
+          
+          # Integrate Susfs module
+          echo "Integrating Susfs module..."
           cd KernelSU
-          git remote add ksu-susfs https://github.com/sidex15/ksu_module_susfs.git
-          git fetch ksu-susfs
-          git checkout -b susfs-main ksu-susfs/main
+          git remote add ksu-susfs https://github.com/sidex15/ksu_module_susfs.git || git remote set-url ksu-susfs https://github.com/sidex15/ksu_module_susfs.git
+          git fetch ksu-susfs main
+          
+          # Note: Ensure Susfs is properly patched into KernelSU
+          # Adjust this based on susfs integration method (may need additional steps)
           cd ..
           
-          # Pastikan susfs terintegrasi ke kernel tree
-          # (Beberapa source memerlukan perintah tambahan tergantung implementasi)
+          echo "KernelSU setup complete"
+
+      - name: Verify Build Configuration
+        run: |
+          set -e
+          
+          # Verify defconfig exists
+          if [ ! -f "arch/arm64/configs/cepheus_defconfig" ]; then
+            echo "ERROR: cepheus_defconfig not found"
+            exit 1
+          fi
+          
+          # Check for KernelSU integration hooks
+          if grep -q "CONFIG_KSU" arch/arm64/configs/cepheus_defconfig; then
+            echo "✓ KernelSU config found in defconfig"
+          else
+            echo "⚠ WARNING: CONFIG_KSU not found in defconfig - KernelSU may not be enabled"
+          fi
 
       - name: Build Kernel
         run: |
+          set -e
+          
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
-          export CC=clang
+          export CC=clang-14
           export CLANG_TRIPLE=aarch64-linux-gnu-
           
-          make O=out cepheus_defconfig
+          # Clean previous builds
+          rm -rf out
+          mkdir -p out
           
-          # Tambahkan opsi tambahan jika perlu (misal: CONFIG_KSU=y)
-          make -j$(nproc) O=out
+          echo "Building kernel with cepheus_defconfig..."
+          make O=out cepheus_defconfig
+          make -j$(nproc) O=out 2>&1 | tee build.log
+          
+          # Verify kernel image was created
+          if [ ! -f "out/arch/arm64/boot/Image.gz-dtb" ]; then
+            echo "ERROR: Kernel image not generated"
+            echo "=== Last 50 lines of build log ==="
+            tail -50 build.log
+            exit 1
+          fi
+          
+          echo "✓ Kernel image generated successfully"
+          ls -lh out/arch/arm64/boot/Image.gz-dtb
 
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v3
+      - name: Upload Kernel Artifact
+        if: success()
+        uses: actions/upload-artifact@v4
         with:
           name: Kernel-Resukisu-Cepheus
           path: out/arch/arm64/boot/Image.gz-dtb
+          retention-days: 30
+
+      - name: Upload Build Log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Build-Log
+          path: build.log
+          retention-days: 7
+
+      - name: Build Status Summary
+        if: always()
+        run: |
+          echo "=== Build Summary ==="
+          echo "Repository: ${{ github.repository }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Commit: ${{ github.sha }}"
+          echo ""
+          if [ -f "out/arch/arm64/boot/Image.gz-dtb" ]; then
+            echo "✓ Build Status: SUCCESS"
+            ls -lh out/arch/arm64/boot/Image.gz-dtb
+          else
+            echo "✗ Build Status: FAILED (kernel image not found)"
+          fi
